@@ -1,5 +1,6 @@
 import asyncio
 import gzip
+import json
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -38,6 +39,7 @@ async def test_create_job_and_complete(tmp_path: Path):
 
         assert detail["status"] == "COMPLETED"
         assert detail["branch"].startswith("pc/demo-repo/")
+        assert detail["stdout_preview"] is not None
 
     stdout_log_gz = tmp_path / "logs" / f"job-{job_id}.stdout.log.gz"
     stderr_log_gz = tmp_path / "logs" / f"job-{job_id}.stderr.log.gz"
@@ -169,6 +171,7 @@ async def test_interactive_job_waits_input_and_completes(tmp_path: Path):
         assert waiting is not None
         assert waiting["status"] == "WAITING_INPUT"
         assert waiting["input_prompt"] == "Choose an option"
+        assert waiting["input_options"] == ["option-1", "option-2"]
 
         sent = await client.post(f"/jobs/{job_id}/input", json={"text": "option-1"})
         assert sent.status_code == 200
@@ -182,10 +185,13 @@ async def test_interactive_job_waits_input_and_completes(tmp_path: Path):
 
         assert done is not None
         assert done["status"] == "COMPLETED"
+        assert done["input_options"] == []
 
     stdout_log_gz = tmp_path / "logs" / f"job-{job_id}.stdout.log.gz"
     assert stdout_log_gz.exists()
-    assert "received: option-1" in gzip.decompress(stdout_log_gz.read_bytes()).decode()
+    output = gzip.decompress(stdout_log_gz.read_bytes()).decode()
+    assert "tty stdin=True stdout=True" in output
+    assert "received: option-1" in output
 
 
 @pytest.mark.asyncio
@@ -227,7 +233,7 @@ async def test_unknown_engine_returns_400(tmp_path: Path):
         response = await client.post(
             "/jobs",
             json={
-                "engine": "codex",
+                "engine": "unknown-engine",
                 "repo": "unknown",
                 "mode": "SAFE",
                 "prompt": "test",
@@ -356,3 +362,250 @@ async def test_api_key_guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             headers={"x-api-key": "secret"},
         )
         assert allowed.status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_list_engines_endpoint(tmp_path: Path):
+    app = create_app(tmp_path)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/engines")
+        assert response.status_code == 200
+        payload = response.json()
+        names = {item["name"] for item in payload}
+        assert {"codex", "cloudcode", "opencode"}.issubset(names)
+        codex = next(item for item in payload if item["name"] == "codex")
+        assert codex["capabilities"]["supports_noninteractive"] is True
+
+
+@pytest.mark.asyncio
+async def test_health_ready_metrics_endpoints(tmp_path: Path):
+    app = create_app(tmp_path)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        health = await client.get("/health")
+        assert health.status_code == 200
+        health_payload = health.json()
+        assert health_payload["status"] == "ok"
+        assert health_payload["uptime_seconds"] >= 0
+
+        ready = await client.get("/ready")
+        assert ready.status_code == 200
+        ready_payload = ready.json()
+        assert ready_payload["status"] == "ready"
+        assert ready_payload["db_ok"] is True
+        assert ready_payload["disk_ok"] is True
+        assert ready_payload["free_disk_mb"] > 0
+
+        metrics = await client.get("/metrics")
+        assert metrics.status_code == 200
+        assert "pocketcoder_uptime_seconds" in metrics.text
+        assert "pocketcoder_jobs_total" in metrics.text
+        assert "pocketcoder_disk_free_megabytes" in metrics.text
+
+
+@pytest.mark.asyncio
+async def test_readiness_and_create_job_fail_on_low_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("POCKETCODER_MIN_FREE_DISK_MB", "1024")
+    disk_tuple = type("DiskUsage", (), {})
+
+    def fake_disk_usage(_: Path):
+        result = disk_tuple()
+        result.total = 10 * 1024 * 1024
+        result.used = 9 * 1024 * 1024
+        result.free = 16 * 1024
+        return result
+
+    monkeypatch.setattr("pocketcoder_daemon.manager.shutil.disk_usage", fake_disk_usage)
+
+    app = create_app(tmp_path)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        ready = await client.get("/ready")
+        assert ready.status_code == 503
+
+        create = await client.post(
+            "/jobs",
+            json={"engine": "mock", "repo": "diskguard", "mode": "SAFE", "prompt": "run"},
+        )
+        assert create.status_code == 409
+        assert "Insufficient free disk space" in create.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_cli_tools_install_update_endpoints(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("POCKETCODER_CODEX_INSTALL_CMD", "python3 -c \"print('install codex ok')\"")
+    monkeypatch.setenv("POCKETCODER_CODEX_UPDATE_CMD", "python3 -c \"print('update codex ok')\"")
+
+    app = create_app(tmp_path)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        listed = await client.get("/cli/tools")
+        assert listed.status_code == 200
+        tools = listed.json()
+        assert any(tool["name"] == "codex" for tool in tools)
+
+        install = await client.post("/cli/tools/codex/install")
+        assert install.status_code == 200
+        install_payload = install.json()
+        assert install_payload["name"] == "codex"
+        assert install_payload["action"] == "install"
+        assert install_payload["status"] == "ok"
+
+        update = await client.post("/cli/tools/codex/update")
+        assert update.status_code == 200
+        update_payload = update.json()
+        assert update_payload["name"] == "codex"
+        assert update_payload["action"] == "update"
+        assert update_payload["status"] == "ok"
+
+        bad = await client.post("/cli/tools/unknown/install")
+        assert bad.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_codex_engine_runs_with_configured_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(
+        "POCKETCODER_CODEX_SAFE_COMMAND_JSON",
+        json.dumps(
+            [
+                "python3",
+                "-c",
+                "import sys; print('codex safe prompt=' + sys.argv[-1])",
+                "{prompt}",
+            ]
+        ),
+    )
+    app = create_app(tmp_path)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.post(
+            "/jobs",
+            json={
+                "engine": "codex",
+                "repo": "codex-repo",
+                "mode": "SAFE",
+                "prompt": "implement parser",
+            },
+        )
+        assert created.status_code == 201
+        job_id = created.json()["id"]
+
+        detail = None
+        for _ in range(100):
+            detail = (await client.get(f"/jobs/{job_id}")).json()
+            if detail["status"] in {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"}:
+                break
+            await asyncio.sleep(0.02)
+
+        assert detail is not None
+        assert detail["status"] == "COMPLETED"
+
+    stdout_log_gz = tmp_path / "logs" / f"job-{job_id}.stdout.log.gz"
+    assert stdout_log_gz.exists()
+    output = gzip.decompress(stdout_log_gz.read_bytes()).decode()
+    assert "codex safe prompt=implement parser" in output
+
+
+@pytest.mark.asyncio
+async def test_cloudcode_engine_runs_with_configured_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv(
+        "POCKETCODER_CLOUDCODE_SAFE_COMMAND_JSON",
+        json.dumps(
+            [
+                "python3",
+                "-c",
+                "import sys; print('cloudcode safe prompt=' + sys.argv[-1])",
+                "{prompt}",
+            ]
+        ),
+    )
+    app = create_app(tmp_path)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.post(
+            "/jobs",
+            json={
+                "engine": "cloudcode",
+                "repo": "cloudcode-repo",
+                "mode": "SAFE",
+                "prompt": "build feature",
+            },
+        )
+        assert created.status_code == 201
+        job_id = created.json()["id"]
+
+        detail = None
+        for _ in range(100):
+            detail = (await client.get(f"/jobs/{job_id}")).json()
+            if detail["status"] in {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"}:
+                break
+            await asyncio.sleep(0.02)
+
+        assert detail is not None
+        assert detail["status"] == "COMPLETED"
+
+    stdout_log_gz = tmp_path / "logs" / f"job-{job_id}.stdout.log.gz"
+    assert stdout_log_gz.exists()
+    output = gzip.decompress(stdout_log_gz.read_bytes()).decode()
+    assert "cloudcode safe prompt=build feature" in output
+
+
+@pytest.mark.asyncio
+async def test_stdout_log_rotation_creates_multiple_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("POCKETCODER_LOG_MAX_BYTES", "100")
+    monkeypatch.setenv("POCKETCODER_LOG_BACKUP_COUNT", "2")
+    monkeypatch.setenv(
+        "POCKETCODER_CODEX_SAFE_COMMAND_JSON",
+        json.dumps(
+            [
+                "python3",
+                "-c",
+                (
+                    "import sys; "
+                    "[print('line-' + str(i) + '-' + ('x'*40), flush=True) for i in range(20)]"
+                ),
+                "{prompt}",
+            ]
+        ),
+    )
+    app = create_app(tmp_path)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.post(
+            "/jobs",
+            json={
+                "engine": "codex",
+                "repo": "rotate-repo",
+                "mode": "SAFE",
+                "prompt": "rotate",
+            },
+        )
+        assert created.status_code == 201
+        job_id = created.json()["id"]
+
+        detail = None
+        for _ in range(120):
+            detail = (await client.get(f"/jobs/{job_id}")).json()
+            if detail["status"] in {"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT"}:
+                break
+            await asyncio.sleep(0.02)
+
+        assert detail is not None
+        assert detail["status"] == "COMPLETED"
+
+    stdout_artifacts = [path for path in detail["artifacts"] if "stdout" in path]
+    assert len(stdout_artifacts) >= 2
+    assert any(path.endswith(".stdout.log.1.gz") for path in stdout_artifacts)

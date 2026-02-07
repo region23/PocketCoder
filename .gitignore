@@ -3,3 +3,8 @@ __pycache__/
 .pytest_cache/
 runtime/
 *.db
+.env
+.vscode/
+.idea/
+.DS_Store
+*.log

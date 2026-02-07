@@ -60,7 +60,58 @@ class Job(BaseModel):
     commit_hash: str | None = None
     timeout_seconds: float | None = None
     input_prompt: str | None = None
+    input_options: list[str] = Field(default_factory=list)
+    stdout_preview: str | None = None
     artifacts: list[str] = Field(default_factory=list)
+
+
+class EngineCapabilitiesView(BaseModel):
+    supports_json_events: bool
+    supports_noninteractive: bool
+    supports_yolo: bool
+    requires_pty: bool
+
+
+class EngineInfo(BaseModel):
+    name: str
+    capabilities: EngineCapabilitiesView
+
+
+class HealthStatus(BaseModel):
+    status: str
+    started_at: datetime
+    now: datetime
+    uptime_seconds: float
+
+
+class ReadinessStatus(BaseModel):
+    status: str
+    db_ok: bool
+    disk_ok: bool
+    min_free_disk_mb: float
+    free_disk_mb: float
+
+
+class CLIToolStatus(BaseModel):
+    name: str
+    binary: str
+    resolved_path: str | None = None
+    available: bool
+    version: str | None = None
+    install_command_configured: bool
+    update_command_configured: bool
+    last_action: str | None = None
+    last_action_status: str | None = None
+    last_action_message: str | None = None
+    last_action_at: datetime | None = None
+
+
+class CLIActionResult(BaseModel):
+    name: str
+    action: str
+    status: str
+    message: str
+    at: datetime
 
 
 def utcnow() -> datetime:

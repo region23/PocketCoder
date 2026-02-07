@@ -37,6 +37,9 @@ class DaemonClient:
     async def list_jobs(self) -> list[dict[str, Any]]:
         return await self._request("GET", "/jobs")
 
+    async def list_engines(self) -> list[dict[str, Any]]:
+        return await self._request("GET", "/engines")
+
     async def get_job(self, job_id: int) -> dict[str, Any]:
         return await self._request("GET", f"/jobs/{job_id}")
 

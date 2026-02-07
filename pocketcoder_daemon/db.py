@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -34,7 +35,9 @@ class JobStore:
                 finished_at TEXT,
                 commit_hash TEXT,
                 timeout_seconds REAL,
-                input_prompt TEXT
+                input_prompt TEXT,
+                input_options TEXT,
+                stdout_preview TEXT
             )
             """
         )
@@ -68,6 +71,8 @@ class JobStore:
         )
         self._ensure_column("jobs", "timeout_seconds", "REAL")
         self._ensure_column("jobs", "input_prompt", "TEXT")
+        self._ensure_column("jobs", "input_options", "TEXT")
+        self._ensure_column("jobs", "stdout_preview", "TEXT")
         self.conn.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -78,8 +83,25 @@ class JobStore:
 
     def _to_job(self, row: sqlite3.Row) -> Job:
         payload = dict(row)
+        payload["input_options"] = self._decode_json_list(payload.get("input_options"))
         payload["artifacts"] = self._list_artifacts(payload["id"])
         return Job.model_validate(payload)
+
+    @staticmethod
+    def _decode_json_list(raw: str | None) -> list[str]:
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(parsed, list):
+            return []
+        result: list[str] = []
+        for item in parsed:
+            if isinstance(item, str):
+                result.append(item)
+        return result
 
     def _remember_catalog(self, engine: str, repo: str) -> None:
         self.conn.execute("INSERT OR IGNORE INTO engines (name) VALUES (?)", (engine,))
@@ -105,12 +127,19 @@ class JobStore:
         rows = self.conn.execute("SELECT * FROM jobs ORDER BY id DESC").fetchall()
         return [self._to_job(row) for row in rows]
 
-    def update(self, job_id: int, **extras: str | float | None) -> Job:
+    def update(self, job_id: int, **extras: str | float | list[str] | None) -> Job:
         if not extras:
             return self.get(job_id)
         assignments: list[str] = []
         values: list[str | float | None] = []
         for key, value in extras.items():
+            if key == "input_options":
+                if value is None:
+                    value = None
+                elif isinstance(value, list):
+                    value = json.dumps(value)
+                else:
+                    raise TypeError("input_options must be list[str] | None")
             assignments.append(f"{key} = ?")
             values.append(value)
         values.append(job_id)
@@ -125,7 +154,7 @@ class JobStore:
         self,
         job_id: int,
         status: JobStatus,
-        **extras: str | float | None,
+        **extras: str | float | list[str] | None,
     ) -> Job:
         return self.update(job_id, status=status, **extras)
 
@@ -159,3 +188,16 @@ class JobStore:
             (JobStatus.LOST, *TERMINAL_STATUSES),
         )
         self.conn.commit()
+
+    def ping(self) -> bool:
+        row = self.conn.execute("SELECT 1").fetchone()
+        return row is not None
+
+    def counts_by_status(self) -> dict[str, int]:
+        rows = self.conn.execute(
+            "SELECT status, COUNT(*) AS cnt FROM jobs GROUP BY status"
+        ).fetchall()
+        result: dict[str, int] = {}
+        for row in rows:
+            result[str(row["status"])] = int(row["cnt"])
+        return result

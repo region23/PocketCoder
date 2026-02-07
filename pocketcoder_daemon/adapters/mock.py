@@ -43,7 +43,8 @@ class InteractiveAdapter(EngineAdapter):
             "-c",
             (
                 "import sys; "
-                "print('INPUT_REQUIRED:Choose an option', flush=True); "
+                "print(f'tty stdin={sys.stdin.isatty()} stdout={sys.stdout.isatty()}', flush=True); "
+                "print('INPUT_REQUIRED_JSON:{\"prompt\":\"Choose an option\",\"options\":[\"option-1\",\"option-2\"]}', flush=True); "
                 "answer = sys.stdin.readline().strip(); "
                 "print(f'received: {answer}', flush=True)"
             ),
