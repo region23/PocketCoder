@@ -2,9 +2,15 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+ENV PATH="/root/.local/bin:/root/.opencode/bin:${PATH}"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git \
+    && apt-get install -y --no-install-recommends \
+        git \
+        curl \
+        nodejs \
+        npm \
+    && printf '%s\n' 'export PATH="/root/.local/bin:/root/.opencode/bin:$PATH"' > /etc/profile.d/pocketcoder-path.sh \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

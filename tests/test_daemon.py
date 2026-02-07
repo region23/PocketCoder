@@ -552,6 +552,27 @@ async def test_cli_tools_install_update_endpoints(tmp_path: Path, monkeypatch: p
 
 
 @pytest.mark.asyncio
+async def test_cli_tools_install_pipeline_honors_pipefail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv(
+        "POCKETCODER_CODEX_INSTALL_CMD",
+        "__definitely_missing_command_123__ | cat",
+    )
+
+    app = create_app(tmp_path)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        install = await client.post("/cli/tools/codex/install")
+        assert install.status_code == 200
+        payload = install.json()
+        assert payload["name"] == "codex"
+        assert payload["action"] == "install"
+        assert payload["status"] == "error"
+
+
+@pytest.mark.asyncio
 async def test_codex_engine_runs_with_configured_command(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv(
         "POCKETCODER_CODEX_SAFE_COMMAND_JSON",

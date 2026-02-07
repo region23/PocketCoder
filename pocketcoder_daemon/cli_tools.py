@@ -61,8 +61,8 @@ class CLIToolManager:
         spec = self.specs.get(name)
         if spec is None:
             raise CLIToolError(f"Unknown CLI tool: {name}")
-        command = self._action_command(spec, action)
-        if not command:
+        action_script = self._action_script(spec, action)
+        if not action_script:
             result = CLIActionResult(
                 name=name,
                 action=action,
@@ -73,6 +73,7 @@ class CLIToolManager:
             self._last_actions[name] = result
             return result
 
+        command = self._shell_command(action_script)
         async with self._action_lock:
             completed = await asyncio.to_thread(
                 subprocess.run,
@@ -106,8 +107,8 @@ class CLIToolManager:
             resolved_path=resolved_path,
             available=available,
             version=version,
-            install_command_configured=self._action_command(spec, "install") is not None,
-            update_command_configured=self._action_command(spec, "update") is not None,
+            install_command_configured=self._action_script(spec, "install") is not None,
+            update_command_configured=self._action_script(spec, "update") is not None,
             last_action=last.action if last else None,
             last_action_status=last.status if last else None,
             last_action_message=last.message if last else None,
@@ -124,13 +125,22 @@ class CLIToolManager:
         )
         return shlex.split(raw)
 
-    def _action_command(self, spec: CLIToolSpec, action: str) -> list[str] | None:
+    def _action_script(self, spec: CLIToolSpec, action: str) -> str | None:
         raw = os.getenv(f"POCKETCODER_{spec.env_prefix}_{action.upper()}_CMD")
         if not raw:
             return None
         binary = self._binary(spec)
-        rendered = raw.replace("{bin}", binary)
-        return shlex.split(rendered)
+        return raw.replace("{bin}", binary)
+
+    def _shell_command(self, script: str) -> list[str]:
+        # Lifecycle commands are configured by the operator and may include pipelines.
+        bash = shutil.which("bash")
+        if bash is not None:
+            return [bash, "-o", "pipefail", "-c", script]
+        shell = shutil.which("sh")
+        if shell is not None:
+            return [shell, "-c", script]
+        raise CLIToolError("No shell found to run CLI lifecycle command")
 
     def _detect_version(self, binary: str, spec: CLIToolSpec) -> str | None:
         args = self._version_args(spec)

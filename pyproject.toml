@@ -26,5 +26,8 @@ dev = [
   "pytest-asyncio>=0.23.0",
 ]
 
+[tool.setuptools]
+packages = ["pocketcoder_daemon", "pocketcoder_daemon.adapters", "pocketcoder_bot"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

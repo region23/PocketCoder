@@ -1,0 +1,2 @@
+pocketcoder_bot
+pocketcoder_daemon

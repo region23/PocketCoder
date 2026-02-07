@@ -77,7 +77,10 @@ class DaemonClient:
             timeout=20.0,
             transport=transport,
         ) as client:
-            response = await client.request(method, path, json=json, headers=headers)
+            try:
+                response = await client.request(method, path, json=json, headers=headers)
+            except httpx.HTTPError as exc:
+                raise DaemonAPIError(str(exc)) from exc
         if response.status_code >= 400:
             detail = response.text
             try:

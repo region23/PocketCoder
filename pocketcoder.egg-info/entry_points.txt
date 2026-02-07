@@ -1,0 +1,3 @@
+[console_scripts]
+pocketcoder-bot = pocketcoder_bot.main:run
+pocketcoder-daemon = pocketcoder_daemon.main:run
