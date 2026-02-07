@@ -1,0 +1,30 @@
+services:
+  daemon:
+    build:
+      context: .
+      dockerfile: Dockerfile.daemon
+    container_name: pocketcoder-daemon
+    ports:
+      - "8080:8080"
+    environment:
+      POCKETCODER_HOST: 0.0.0.0
+      POCKETCODER_PORT: 8080
+      POCKETCODER_API_KEY: ${POCKETCODER_API_KEY:-}
+    volumes:
+      - ./runtime/data:/app/data
+      - ./runtime/logs:/app/logs
+      - ./runtime/projects:/app/projects
+    restart: unless-stopped
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    container_name: pocketcoder-bot
+    environment:
+      POCKETCODER_DAEMON_URL: http://daemon:8080
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      POCKETCODER_API_KEY: ${POCKETCODER_API_KEY:-}
+    depends_on:
+      - daemon
+    restart: unless-stopped
