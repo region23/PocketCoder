@@ -7,12 +7,12 @@ import shutil
 import subprocess
 
 from pocketcoder_daemon.adapters.codex import CloudCodeAdapter, CodexAdapter, OpenCodeAdapter
-from pocketcoder_daemon.adapters.mock import InteractiveAdapter, MockAdapter, SleepyAdapter
 from pocketcoder_daemon.cli_tools import CLIToolError, CLIToolManager
 from pocketcoder_daemon.db import JobStore
 from pocketcoder_daemon.models import (
     CLIActionResult,
     CLIToolStatus,
+    DEFAULT_JOB_TIMEOUT_SECONDS,
     EngineCapabilitiesView,
     EngineInfo,
     HealthStatus,
@@ -52,9 +52,6 @@ class JobManager:
         self.runner = ExecutionRunner(self.store, root / "logs")
         self.cli_tools = CLIToolManager()
         self.adapters = {
-            "mock": MockAdapter(),
-            "sleepy": SleepyAdapter(),
-            "interactive": InteractiveAdapter(),
             "codex": CodexAdapter(),
             "cloudcode": CloudCodeAdapter(),
             "opencode": OpenCodeAdapter(),
@@ -81,6 +78,11 @@ class JobManager:
                 f"Engine {payload.engine} cannot run non-interactively in YOLO mode"
             )
 
+        timeout_seconds = (
+            payload.timeout_seconds
+            if payload.timeout_seconds is not None
+            else float(DEFAULT_JOB_TIMEOUT_SECONDS)
+        )
         branch = f"pc/{payload.repo}/{utcnow().strftime('%Y%m%d%H%M%S')}"
         stdout_path = self.root / "logs" / f"job-{{id}}.stdout.log"
         stderr_path = self.root / "logs" / f"job-{{id}}.stderr.log"
@@ -90,19 +92,23 @@ class JobManager:
                 "repo": payload.repo,
                 "branch": branch,
                 "mode": payload.mode,
-                "status": JobStatus.STARTING,
+                "status": JobStatus.CREATED,
                 "prompt": payload.prompt,
                 "stdout_log_path": str(stdout_path).format(id="placeholder"),
                 "stderr_log_path": str(stderr_path).format(id="placeholder"),
                 "created_at": utcnow().isoformat(),
-                "timeout_seconds": payload.timeout_seconds,
+                "timeout_seconds": timeout_seconds,
+                "requester_user_id": payload.requester_user_id,
+                "requester_chat_id": payload.requester_chat_id,
             }
         )
         workspace = self.root / "projects" / payload.repo
         workspace.mkdir(parents=True, exist_ok=True)
+        self._ensure_git_repo(workspace)
         self._prepare_branch(workspace, branch)
-        self.store.update(
+        self.store.update_status(
             job.id,
+            JobStatus.STARTING,
             stdout_log_path=str(stdout_path).format(id=job.id),
             stderr_log_path=str(stderr_path).format(id=job.id),
         )
@@ -112,7 +118,7 @@ class JobManager:
             payload.prompt,
             payload.mode,
             branch=branch,
-            timeout_seconds=payload.timeout_seconds,
+            timeout_seconds=timeout_seconds,
             cwd=workspace,
         )
         return self.store.get(job.id)
@@ -246,19 +252,40 @@ class JobManager:
         return "\n".join(lines) + "\n"
 
     def _prepare_branch(self, workspace: Path, branch: str) -> None:
-        if not (workspace / ".git").exists():
+        self._run_git(workspace, ["checkout", "-B", branch], "Failed to prepare git branch")
+
+    def _ensure_git_repo(self, workspace: Path) -> None:
+        if (workspace / ".git").exists():
             return
+        self._run_git(workspace, ["init"], "Failed to initialize git repository")
+        user_name = os.getenv("POCKETCODER_GIT_USER_NAME", "PocketCoder")
+        user_email = os.getenv("POCKETCODER_GIT_USER_EMAIL", "pocketcoder@local")
+        self._run_git(workspace, ["config", "user.name", user_name], "Failed to set git user.name")
+        self._run_git(
+            workspace,
+            ["config", "user.email", user_email],
+            "Failed to set git user.email",
+        )
+        self._run_git(
+            workspace,
+            ["commit", "--allow-empty", "-m", "Initialize workspace"],
+            "Failed to create initial git commit",
+        )
+
+    @staticmethod
+    def _run_git(workspace: Path, args: list[str], fallback_message: str) -> None:
         result = subprocess.run(
-            ["git", "checkout", "-B", branch],
+            ["git", *args],
             cwd=workspace,
             capture_output=True,
             text=True,
             check=False,
         )
-        if result.returncode != 0:
-            raise InvalidStateError(
-                result.stderr.strip() or result.stdout.strip() or "Failed to prepare git branch"
-            )
+        if result.returncode == 0:
+            return
+        raise InvalidStateError(
+            result.stderr.strip() or result.stdout.strip() or fallback_message
+        )
 
     @staticmethod
     def _env_float(name: str, default: float) -> float:

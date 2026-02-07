@@ -21,12 +21,13 @@ from telegram.ext import (
 from pocketcoder_bot.access import AccessPolicy, is_allowed
 from pocketcoder_bot.daemon_client import DaemonAPIError, DaemonClient
 
-DEFAULT_ENGINES = ("codex", "cloudcode", "opencode", "mock", "sleepy", "interactive")
+DEFAULT_ENGINES = ("codex", "cloudcode", "opencode")
 SUPPORTED_MODES = ("YOLO", "SAFE")
 WIZARD_DATA_KEY = "wizard_draft"
 PENDING_INPUT_JOB_KEY = "pending_input_job_id"
 WIZARD_ENGINES_KEY = "wizard_engines"
 JOB_INPUT_OPTIONS_KEY = "job_input_options_cache"
+JOB_STATUS_CACHE_KEY = "job_status_cache"
 MAX_TIMEOUT_SECONDS = 24 * 60 * 60
 
 
@@ -40,7 +41,10 @@ class WizardState(IntEnum):
 
 
 def _daemon_client() -> DaemonClient:
+    uds_path = os.getenv("POCKETCODER_DAEMON_UDS")
     url = os.getenv("POCKETCODER_DAEMON_URL", "http://127.0.0.1:8080")
+    if uds_path:
+        return DaemonClient(base_url="http://daemon", uds_path=uds_path)
     return DaemonClient(base_url=url)
 
 
@@ -51,6 +55,7 @@ def _help_text() -> str:
         "/cancelwizard - abort wizard\n"
         "/create <engine> <repo> <mode> <prompt>\n"
         "/jobs\n"
+        "/lost\n"
         "/job <id>\n"
         "/cancel <id>\n"
         "/input <id> [text]"
@@ -280,6 +285,88 @@ def _cached_job_input_options(context: ContextTypes.DEFAULT_TYPE, job_id: int) -
     return result
 
 
+def _job_requester_chat_id(job: dict) -> int | None:
+    chat_id = job.get("requester_chat_id")
+    if isinstance(chat_id, int):
+        return chat_id
+    return None
+
+
+def _status_cache(context: ContextTypes.DEFAULT_TYPE) -> dict[int, str]:
+    raw = context.application.bot_data.get(JOB_STATUS_CACHE_KEY)
+    if isinstance(raw, dict):
+        normalized: dict[int, str] = {}
+        for key, value in raw.items():
+            if isinstance(key, int) and isinstance(value, str):
+                normalized[key] = value
+        if normalized != raw:
+            context.application.bot_data[JOB_STATUS_CACHE_KEY] = normalized
+        return normalized
+    cache: dict[int, str] = {}
+    context.application.bot_data[JOB_STATUS_CACHE_KEY] = cache
+    return cache
+
+
+async def _notify_waiting_input(context: ContextTypes.DEFAULT_TYPE, job: dict) -> None:
+    chat_id = _job_requester_chat_id(job)
+    if chat_id is None:
+        return
+    prompt = job.get("input_prompt")
+    prompt_text = prompt if isinstance(prompt, str) and prompt else "Input required"
+    text = f"Job #{job['id']} waiting input: {prompt_text}\n\n{_format_job(job)}"
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=_job_actions_keyboard(job),
+        )
+    except Exception:
+        return
+
+
+async def _notify_lost_job(context: ContextTypes.DEFAULT_TYPE, job: dict) -> None:
+    chat_id = _job_requester_chat_id(job)
+    if chat_id is None:
+        return
+    text = (
+        f"Job #{job['id']} marked as LOST after daemon restart.\n"
+        "Check job details and continue manually if needed.\n\n"
+        f"{_format_job(job)}"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=_job_actions_keyboard(job),
+        )
+    except Exception:
+        return
+
+
+async def poll_job_updates(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        jobs = await _daemon_client().list_jobs()
+    except DaemonAPIError:
+        return
+    cache = _status_cache(context)
+    seen: set[int] = set()
+    for job in jobs:
+        job_id = job.get("id")
+        status = job.get("status")
+        if not isinstance(job_id, int) or not isinstance(status, str):
+            continue
+        seen.add(job_id)
+        previous = cache.get(job_id)
+        if status == "WAITING_INPUT" and previous != "WAITING_INPUT":
+            await _notify_waiting_input(context, job)
+        if status == "LOST" and previous != "LOST":
+            await _notify_lost_job(context, job)
+        cache[job_id] = status
+    stale_ids = [job_id for job_id in cache if job_id not in seen]
+    for job_id in stale_ids:
+        cache.pop(job_id, None)
+
+
 def _draft_summary(draft: dict[str, object]) -> str:
     timeout_seconds = draft.get("timeout_seconds")
     timeout_text = "none" if timeout_seconds is None else str(timeout_seconds)
@@ -358,12 +445,15 @@ async def create_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     engine, repo, mode = context.args[0], context.args[1], context.args[2]
     prompt = " ".join(context.args[3:])
+    requester_user_id, requester_chat_id = _actor_ids(update)
     try:
         job = await _daemon_client().create_job(
             engine=engine,
             repo=repo,
             mode=mode.upper(),
             prompt=prompt,
+            requester_user_id=requester_user_id,
+            requester_chat_id=requester_chat_id,
         )
     except DaemonAPIError as exc:
         await update.message.reply_text(f"Create failed: {exc}")
@@ -384,6 +474,24 @@ async def jobs_command(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("No jobs yet")
         return
     await update.message.reply_text("Jobs:", reply_markup=_jobs_keyboard(jobs))
+
+
+async def lost_jobs_command(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    try:
+        jobs = await _daemon_client().list_jobs()
+    except DaemonAPIError as exc:
+        await update.message.reply_text(f"List failed: {exc}")
+        return
+    lost = [job for job in jobs if job.get("status") == "LOST"]
+    if not lost:
+        await update.message.reply_text("No LOST jobs")
+        return
+    lines = ["LOST jobs:"]
+    for job in lost[:10]:
+        lines.append(f"#{job['id']} repo={job.get('repo')} branch={job.get('branch')}")
+    await update.message.reply_text("\n".join(lines))
 
 
 def _parse_job_id(args: Sequence[str]) -> int | None:
@@ -823,6 +931,7 @@ async def wizard_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     timeout_value = draft.get("timeout_seconds")
     timeout_seconds = timeout_value if isinstance(timeout_value, float) else None
+    requester_user_id, requester_chat_id = _actor_ids(update)
     try:
         job = await _daemon_client().create_job(
             engine=engine,
@@ -830,6 +939,8 @@ async def wizard_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             mode=mode,
             prompt=prompt,
             timeout_seconds=timeout_seconds,
+            requester_user_id=requester_user_id,
+            requester_chat_id=requester_chat_id,
         )
     except DaemonAPIError as exc:
         await query.edit_message_text(
@@ -899,6 +1010,7 @@ def run() -> None:
     app.add_handler(CommandHandler("cancelwizard", cancel_wizard_command))
     app.add_handler(CommandHandler("create", create_command))
     app.add_handler(CommandHandler("jobs", jobs_command))
+    app.add_handler(CommandHandler("lost", lost_jobs_command))
     app.add_handler(CommandHandler("job", job_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("input", input_command))
@@ -910,6 +1022,13 @@ def run() -> None:
         CallbackQueryHandler(job_action_callback, pattern=r"^job:action:\d+:[a-z]+$")
     )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, pending_input_text))
+    watch_interval = float(os.getenv("POCKETCODER_BOT_WATCH_INTERVAL_SECONDS", "5"))
+    if app.job_queue is not None and watch_interval > 0:
+        app.job_queue.run_repeating(
+            poll_job_updates,
+            interval=watch_interval,
+            first=watch_interval,
+        )
     app.run_polling(close_loop=False)
 
 

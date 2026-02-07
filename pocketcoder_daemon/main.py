@@ -9,6 +9,11 @@ from pocketcoder_daemon.app import create_app
 def run() -> None:
     root = Path(os.getenv("POCKETCODER_ROOT", Path.cwd()))
     app = create_app(root)
+    uds = os.getenv("POCKETCODER_UDS")
+    if uds:
+        Path(uds).parent.mkdir(parents=True, exist_ok=True)
+        uvicorn.run(app, uds=uds)
+        return
     host = os.getenv("POCKETCODER_HOST", "127.0.0.1")
     port = int(os.getenv("POCKETCODER_PORT", "8080"))
     uvicorn.run(app, host=host, port=port)

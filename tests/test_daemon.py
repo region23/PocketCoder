@@ -11,6 +11,24 @@ from httpx import ASGITransport, AsyncClient
 from pocketcoder_daemon.app import create_app
 
 
+def _command_json(script: str) -> str:
+    return json.dumps(["python3", "-c", script, "{prompt}"])
+
+
+@pytest.fixture(autouse=True)
+def configure_default_engine_commands(monkeypatch: pytest.MonkeyPatch):
+    default_script = "import sys; print('engine prompt=' + sys.argv[-1])"
+    for prefix in ("CODEX", "CLOUDCODE", "OPENCODE"):
+        monkeypatch.setenv(
+            f"POCKETCODER_{prefix}_SAFE_COMMAND_JSON",
+            _command_json(default_script),
+        )
+        monkeypatch.setenv(
+            f"POCKETCODER_{prefix}_YOLO_COMMAND_JSON",
+            _command_json(default_script),
+        )
+
+
 @pytest.mark.asyncio
 async def test_create_job_and_complete(tmp_path: Path):
     app = create_app(tmp_path)
@@ -20,7 +38,7 @@ async def test_create_job_and_complete(tmp_path: Path):
         response = await client.post(
             "/jobs",
             json={
-                "engine": "mock",
+                "engine": "codex",
                 "repo": "demo-repo",
                 "mode": "YOLO",
                 "prompt": "implement feature",
@@ -30,6 +48,7 @@ async def test_create_job_and_complete(tmp_path: Path):
         created = response.json()
         job_id = created["id"]
         assert created["status"] in {"STARTING", "RUNNING"}
+        assert created["timeout_seconds"] == 24 * 60 * 60
 
         for _ in range(100):
             detail = (await client.get(f"/jobs/{job_id}")).json()
@@ -45,7 +64,8 @@ async def test_create_job_and_complete(tmp_path: Path):
     stderr_log_gz = tmp_path / "logs" / f"job-{job_id}.stderr.log.gz"
     assert stdout_log_gz.exists()
     assert stderr_log_gz.exists()
-    assert "mock engine" in gzip.decompress(stdout_log_gz.read_bytes()).decode()
+    assert "engine prompt=implement feature" in gzip.decompress(stdout_log_gz.read_bytes()).decode()
+    assert (tmp_path / "projects" / "demo-repo" / ".git").exists()
 
     db = sqlite3.connect(tmp_path / "data" / "pocketcoder.db")
     tables = {
@@ -64,20 +84,26 @@ async def test_create_job_and_complete(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_only_one_active_job_per_repo(tmp_path: Path):
+async def test_only_one_active_job_per_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(
+        "POCKETCODER_CODEX_SAFE_COMMAND_JSON",
+        _command_json(
+            "import time; print('started active lock'); time.sleep(0.6); print('finished active lock')"
+        ),
+    )
     app = create_app(tmp_path)
     transport = ASGITransport(app=app)
 
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         first = await client.post(
             "/jobs",
-            json={"engine": "sleepy", "repo": "same", "mode": "SAFE", "prompt": "first"},
+            json={"engine": "codex", "repo": "same", "mode": "SAFE", "prompt": "first"},
         )
         assert first.status_code == 201
 
         second = await client.post(
             "/jobs",
-            json={"engine": "mock", "repo": "same", "mode": "SAFE", "prompt": "second"},
+            json={"engine": "codex", "repo": "same", "mode": "SAFE", "prompt": "second"},
         )
         assert second.status_code == 409
 
@@ -90,14 +116,20 @@ async def test_only_one_active_job_per_repo(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_cancel_job(tmp_path: Path):
+async def test_cancel_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(
+        "POCKETCODER_CODEX_SAFE_COMMAND_JSON",
+        _command_json(
+            "import time; print('started cancel'); time.sleep(2); print('finished cancel')"
+        ),
+    )
     app = create_app(tmp_path)
     transport = ASGITransport(app=app)
 
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         created = await client.post(
             "/jobs",
-            json={"engine": "sleepy", "repo": "cancel", "mode": "SAFE", "prompt": "wait"},
+            json={"engine": "codex", "repo": "cancel", "mode": "SAFE", "prompt": "wait"},
         )
         job_id = created.json()["id"]
 
@@ -121,7 +153,7 @@ async def test_restart_marks_active_jobs_as_lost(tmp_path: Path):
     async with AsyncClient(transport=transport1, base_url="http://test") as client:
         created = await client.post(
             "/jobs",
-            json={"engine": "mock", "repo": "restart", "mode": "SAFE", "prompt": "short"},
+            json={"engine": "codex", "repo": "restart", "mode": "SAFE", "prompt": "short"},
         )
         job_id = created.json()["id"]
 
@@ -145,7 +177,22 @@ async def test_restart_marks_active_jobs_as_lost(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_interactive_job_waits_input_and_completes(tmp_path: Path):
+async def test_interactive_job_waits_input_and_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv(
+        "POCKETCODER_CODEX_SAFE_COMMAND_JSON",
+        _command_json(
+            (
+                "import sys; "
+                "print(f'tty stdin={sys.stdin.isatty()} stdout={sys.stdout.isatty()}', flush=True); "
+                "print('INPUT_REQUIRED_JSON:{\"prompt\":\"Choose an option\",\"options\":[\"option-1\",\"option-2\"]}', flush=True); "
+                "answer = sys.stdin.readline().strip(); "
+                "print(f'received: {answer}', flush=True)"
+            )
+        ),
+    )
+    monkeypatch.setenv("POCKETCODER_CODEX_REQUIRES_PTY", "1")
     app = create_app(tmp_path)
     transport = ASGITransport(app=app)
 
@@ -153,7 +200,7 @@ async def test_interactive_job_waits_input_and_completes(tmp_path: Path):
         created = await client.post(
             "/jobs",
             json={
-                "engine": "interactive",
+                "engine": "codex",
                 "repo": "wizard",
                 "mode": "SAFE",
                 "prompt": "need choice",
@@ -195,7 +242,11 @@ async def test_interactive_job_waits_input_and_completes(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_job_times_out(tmp_path: Path):
+async def test_job_times_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(
+        "POCKETCODER_CODEX_SAFE_COMMAND_JSON",
+        _command_json("import time; print('started timeout'); time.sleep(2); print('done timeout')"),
+    )
     app = create_app(tmp_path)
     transport = ASGITransport(app=app)
 
@@ -203,7 +254,7 @@ async def test_job_times_out(tmp_path: Path):
         created = await client.post(
             "/jobs",
             json={
-                "engine": "sleepy",
+                "engine": "codex",
                 "repo": "timeout",
                 "mode": "SAFE",
                 "prompt": "sleep",
@@ -243,7 +294,39 @@ async def test_unknown_engine_returns_400(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_yolo_with_non_yolo_engine_returns_409(tmp_path: Path):
+async def test_job_stores_requester_metadata(tmp_path: Path):
+    app = create_app(tmp_path)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.post(
+            "/jobs",
+            json={
+                "engine": "codex",
+                "repo": "meta",
+                "mode": "SAFE",
+                "prompt": "run",
+                "requester_user_id": 101,
+                "requester_chat_id": 202,
+            },
+        )
+        assert created.status_code == 201
+        payload = created.json()
+        assert payload["requester_user_id"] == 101
+        assert payload["requester_chat_id"] == 202
+
+        detail = await client.get(f"/jobs/{payload['id']}")
+        assert detail.status_code == 200
+        reloaded = detail.json()
+        assert reloaded["requester_user_id"] == 101
+        assert reloaded["requester_chat_id"] == 202
+
+
+@pytest.mark.asyncio
+async def test_yolo_with_non_yolo_engine_returns_409(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("POCKETCODER_OPENCODE_SUPPORTS_YOLO", "0")
     app = create_app(tmp_path)
     transport = ASGITransport(app=app)
 
@@ -251,7 +334,7 @@ async def test_yolo_with_non_yolo_engine_returns_409(tmp_path: Path):
         response = await client.post(
             "/jobs",
             json={
-                "engine": "interactive",
+                "engine": "opencode",
                 "repo": "mode-check",
                 "mode": "YOLO",
                 "prompt": "test",
@@ -269,7 +352,7 @@ async def test_input_for_non_waiting_job_returns_409(tmp_path: Path):
         created = await client.post(
             "/jobs",
             json={
-                "engine": "sleepy",
+                "engine": "codex",
                 "repo": "no-input",
                 "mode": "SAFE",
                 "prompt": "run",
@@ -313,7 +396,7 @@ async def test_git_branch_prepared_and_commit_hash_recorded(tmp_path: Path):
         created = await client.post(
             "/jobs",
             json={
-                "engine": "mock",
+                "engine": "codex",
                 "repo": "gitrepo",
                 "mode": "SAFE",
                 "prompt": "noop",
@@ -352,13 +435,13 @@ async def test_api_key_guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         denied = await client.post(
             "/jobs",
-            json={"engine": "mock", "repo": "guard", "mode": "SAFE", "prompt": "x"},
+            json={"engine": "codex", "repo": "guard", "mode": "SAFE", "prompt": "x"},
         )
         assert denied.status_code == 401
 
         allowed = await client.post(
             "/jobs",
-            json={"engine": "mock", "repo": "guard", "mode": "SAFE", "prompt": "x"},
+            json={"engine": "codex", "repo": "guard", "mode": "SAFE", "prompt": "x"},
             headers={"x-api-key": "secret"},
         )
         assert allowed.status_code == 201
@@ -430,7 +513,7 @@ async def test_readiness_and_create_job_fail_on_low_disk(
 
         create = await client.post(
             "/jobs",
-            json={"engine": "mock", "repo": "diskguard", "mode": "SAFE", "prompt": "run"},
+            json={"engine": "codex", "repo": "diskguard", "mode": "SAFE", "prompt": "run"},
         )
         assert create.status_code == 409
         assert "Insufficient free disk space" in create.json()["detail"]

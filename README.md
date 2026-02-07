@@ -23,7 +23,7 @@
   - `POST /jobs/{id}/cancel`
   - `POST /jobs/{id}/input`
   - `GET /ready` возвращает `503`, если не готова БД или не хватает свободного диска
-- Job lifecycle: `STARTING -> RUNNING -> WAITING_INPUT -> COMPLETED/FAILED/CANCELLED/TIMEOUT`.
+- Job lifecycle: `CREATED -> STARTING -> RUNNING -> WAITING_INPUT -> COMPLETED/FAILED/CANCELLED/TIMEOUT`.
 - Ограничение: только 1 активная job на репозиторий.
 - Восстановление после рестарта: активные job помечаются как `LOST`.
 - SQLite:
@@ -35,11 +35,12 @@
   - запуск subprocess без shell
   - отдельная process group
   - PTY-режим для engines с `requires_pty=true`
-  - timeout и cancel (SIGTERM/SIGKILL)
+  - timeout и cancel (SIGTERM/SIGKILL), default timeout каждой job = 24h
   - запись stdout/stderr в отдельные файлы
   - size-based rotation логов (`POCKETCODER_LOG_MAX_BYTES`, `POCKETCODER_LOG_BACKUP_COUNT`)
   - gzip логов/сегментов по завершению + регистрация логов как artifacts
-- Git (если workspace уже git-репозиторий):
+- Git:
+  - автоматическая инициализация git-репозитория в workspace (если отсутствует)
   - checkout новой ветки `pc/<repo>/<timestamp>` для job
   - best-effort commit итоговых изменений
   - сохранение `commit_hash` в job
@@ -63,11 +64,13 @@
   - `/cancelwizard`
   - `/create <engine> <repo> <mode> <prompt>`
   - `/jobs`
+  - `/lost`
   - `/job <id>`
   - `/cancel <id>`
   - `/input <id> [text]`
   - inline-кнопки на списке/карточке job: open, refresh, cancel, send input
   - для `WAITING_INPUT` поддерживаются кнопки вариантов (`input_options`) + ручной ввод
+  - bot периодически опрашивает daemon и отправляет proactive уведомления инициатору job для `WAITING_INPUT` и `LOST`
   - для terminal статусов карточка показывает duration, stdout preview, commit и пути логов
   - wizard выбирает engines динамически через `GET /engines` (без локального хардкода)
 
@@ -122,6 +125,13 @@ export POCKETCODER_DAEMON_URL=http://127.0.0.1:8080
 pocketcoder-bot
 ```
 
+Опционально можно использовать Unix domain socket:
+
+```bash
+export POCKETCODER_UDS=/tmp/pocketcoder-daemon.sock
+export POCKETCODER_DAEMON_UDS=/tmp/pocketcoder-daemon.sock
+```
+
 ## Docker Compose
 
 ```bash
@@ -133,4 +143,14 @@ docker compose up --build
 
 ```bash
 pytest -q
+```
+
+Smoke-тесты proactive уведомлений бота находятся в:
+
+- `/Users/region23/code/PocketCoder/tests/test_bot_notifications.py`
+
+E2E daemon-сценарий через Docker Compose:
+
+```bash
+./scripts/e2e_daemon_compose.sh
 ```

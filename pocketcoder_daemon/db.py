@@ -35,6 +35,8 @@ class JobStore:
                 finished_at TEXT,
                 commit_hash TEXT,
                 timeout_seconds REAL,
+                requester_user_id INTEGER,
+                requester_chat_id INTEGER,
                 input_prompt TEXT,
                 input_options TEXT,
                 stdout_preview TEXT
@@ -70,6 +72,8 @@ class JobStore:
             """
         )
         self._ensure_column("jobs", "timeout_seconds", "REAL")
+        self._ensure_column("jobs", "requester_user_id", "INTEGER")
+        self._ensure_column("jobs", "requester_chat_id", "INTEGER")
         self._ensure_column("jobs", "input_prompt", "TEXT")
         self._ensure_column("jobs", "input_options", "TEXT")
         self._ensure_column("jobs", "stdout_preview", "TEXT")
@@ -127,11 +131,11 @@ class JobStore:
         rows = self.conn.execute("SELECT * FROM jobs ORDER BY id DESC").fetchall()
         return [self._to_job(row) for row in rows]
 
-    def update(self, job_id: int, **extras: str | float | list[str] | None) -> Job:
+    def update(self, job_id: int, **extras: str | float | int | list[str] | None) -> Job:
         if not extras:
             return self.get(job_id)
         assignments: list[str] = []
-        values: list[str | float | None] = []
+        values: list[str | float | int | None] = []
         for key, value in extras.items():
             if key == "input_options":
                 if value is None:
@@ -154,7 +158,7 @@ class JobStore:
         self,
         job_id: int,
         status: JobStatus,
-        **extras: str | float | list[str] | None,
+        **extras: str | float | int | list[str] | None,
     ) -> Job:
         return self.update(job_id, status=status, **extras)
 

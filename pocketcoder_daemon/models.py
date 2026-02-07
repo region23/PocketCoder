@@ -5,6 +5,9 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
+MAX_JOB_TIMEOUT_SECONDS = 24 * 60 * 60
+DEFAULT_JOB_TIMEOUT_SECONDS = MAX_JOB_TIMEOUT_SECONDS
+
 
 class JobMode(StrEnum):
     YOLO = "YOLO"
@@ -37,7 +40,9 @@ class JobCreate(BaseModel):
     repo: str = Field(min_length=1)
     mode: JobMode
     prompt: str = Field(min_length=1)
-    timeout_seconds: float | None = Field(default=None, gt=0, le=24 * 60 * 60)
+    timeout_seconds: float | None = Field(default=None, gt=0, le=MAX_JOB_TIMEOUT_SECONDS)
+    requester_user_id: int | None = None
+    requester_chat_id: int | None = None
 
 
 class JobInput(BaseModel):
@@ -59,6 +64,8 @@ class Job(BaseModel):
     finished_at: datetime | None = None
     commit_hash: str | None = None
     timeout_seconds: float | None = None
+    requester_user_id: int | None = None
+    requester_chat_id: int | None = None
     input_prompt: str | None = None
     input_options: list[str] = Field(default_factory=list)
     stdout_preview: str | None = None
